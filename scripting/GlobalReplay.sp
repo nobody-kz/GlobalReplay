@@ -224,4 +224,6 @@ public int MenuHandler_ReplayCompleted(Handle HTTPRequest, bool bFailure, bool b
 		PrintToServer("GlobalReplay: Could not fetch global replay %d with error code %d.", replayId, eStatusCode);
 		GOKZ_PrintToChatAll(true, "Could not fetch global replay %d with error code %d. Contact administrator.", replayId, eStatusCode);
 	}
+
+	CloseHandle(HTTPRequest);
 }
