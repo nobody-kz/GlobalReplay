@@ -5,16 +5,22 @@
 #include <json>
 #include <SteamWorks>
 
-// TODO: bonuses
+// TODO: refactor. this is unreadable
 
 #pragma newdecls required
 #pragma tabsize 0
 #pragma semicolon 1
 
 #define BATCH_SIZE 100
+#define TICK_RATE 128
+#define MAX_STAGE 100
+#define MAX_MODE 3
 
 char gC_CurrentMap[64];
-static int selectedReplayMode[MAXPLAYERS + 1];
+int currentMapId;
+bool isMapGlobal;
+bool filter[MAX_MODE][MAX_STAGE];
+int selectedReplayMode[MAXPLAYERS + 1];
 
 methodmap API3Record < APIRecord {
     property int ReplayId {
@@ -26,12 +32,70 @@ public Plugin myinfo = {
 	name = "Global Replay",
 	author = "nobody",
 	description = "Fetches and plays global records",
-	version = "0.0.1",
+	version = "0.0.2",
 	url = "https://kiwisclub.co/"
 };
 
-static void UpdateCurrentMap() {
+void UpdateCurrentMap() {
+	clearCache();
 	GetCurrentMapDisplayName(gC_CurrentMap, sizeof(gC_CurrentMap));
+	GlobalAPI_GetMapByName(GetMapByNameCallback, DEFAULT_DATA, gC_CurrentMap);
+}
+
+void clearCache() {
+	gC_CurrentMap[0] = 0;
+	currentMapId = 0;
+	isMapGlobal = false;
+	for (int mode = 0; mode < MAX_MODE; mode++) {
+		for (int stage = 0; stage < MAX_STAGE; stage++) {
+			filter[mode][stage] = false;
+		}
+	}
+}
+
+void GetMapByNameCallback(JSON_Object top, GlobalAPIRequestData request)
+{
+	currentMapId = top.GetInt("id");
+
+	isMapGlobal = true;
+
+	int mapIds[1];
+	mapIds[0] = currentMapId;
+
+	for (int offset = 0; offset < 2 * MAX_MODE * MAX_STAGE; offset += BATCH_SIZE) {
+		GlobalAPI_GetRecordFilters(
+			GetRecordFiltersMapCallback,
+			DEFAULT_DATA,
+			{ DEFAULT_INT },
+			DEFAULT_INT,
+			mapIds,
+			1,
+			{ DEFAULT_INT },
+			DEFAULT_INT,
+			{ DEFAULT_INT },
+			DEFAULT_INT,
+			{ TICK_RATE },
+			1,
+			DEFAULT_BOOL,
+			DEFAULT_BOOL,
+			offset,
+			BATCH_SIZE
+		);
+	}
+}
+
+void GetRecordFiltersMapCallback(JSON_Object top, GlobalAPIRequestData request)
+{
+	int n = top.Length;
+	for (int i = 0; i < n; i++) {
+		JSON_Object item = top.GetObjectIndexed(i);
+		int mode = item.GetInt("mode_id");
+		int stage = item.GetInt("stage");
+
+		// gC_ModeNames is VNL, SKZ, KZT
+		// GlobalMode is KZT, SKZ, VNL
+		filter[(MAX_MODE - 1) - (mode - GlobalMode_KZTimer)][stage] = true;
+	}
 }
 
 public void OnPluginStart() {
@@ -47,8 +111,14 @@ public void OnMapStart() {
 
 public Action CommandGlobalReplay(int client, int args)
 {
-	DisplayReplayModeMenu(client);
-
+	if (isMapGlobal) {
+		DisplayReplayModeMenu(client);
+	}
+	else {
+		GOKZ_PrintToChat(client, true, "%t", "No Replays Found (Map)");
+		GOKZ_PlayErrorSound(client);
+	}
+	
 	return Plugin_Handled;
 }
 
@@ -71,33 +141,98 @@ public int MenuHandler_ReplayMode(Menu menu, MenuAction action, int param1, int 
 	{
 		delete menu;
 	}
+	return 0;
 }
 
 static void DisplayReplayMenu(int client) {
 	char modeStr[32];
 	GOKZ_GL_GetModeString(selectedReplayMode[client], modeStr, sizeof(modeStr));
-	
-	DataPack dp = new DataPack();
-	dp.WriteCell(GetClientUserId(client));
-	
-	GlobalAPI_GetRecordsTop(
-		DisplayReplayMenuCallback,
-		dp,
-		DEFAULT_STRING,
-		DEFAULT_STRING,
-		DEFAULT_INT,
-		gC_CurrentMap,
-		128,
-		0, // TODO: pass in stage number
-		modeStr,
-		DEFAULT_BOOL,
-		DEFAULT_STRING,
-		0,
-		BATCH_SIZE
-	);
+
+	Menu menu = new Menu(MenuHandler_Replay);
+	menu.SetTitle("%T", "Replay Menu - Title", client, gC_CurrentMap, gC_ModeNames[selectedReplayMode[client]]);
+	if (ReplayMenuAddItems(selectedReplayMode[client], menu) > 0)
+	{
+		menu.Display(client, MENU_TIME_FOREVER);
+	}
+	else
+	{
+		GOKZ_PrintToChat(client, true, "%t", "No Replays Found (Mode)", gC_ModeNames[selectedReplayMode[client]]);
+		GOKZ_PlayErrorSound(client);
+		DisplayReplayModeMenu(client);
+	}
 }
 
-static void DisplayReplayMenuCallback(JSON_Object top, GlobalAPIRequestData request, DataPack dp)
+// Returns the number of replay menu items added
+static int ReplayMenuAddItems(int mode, Menu menu)
+{
+	int replaysAdded = 0;
+	char temp[32], stageString[4];
+	
+	menu.RemoveAllItems();
+	
+	for (int stage = 0; stage < MAX_STAGE; stage++)
+	{
+		if (filter[mode][stage]) {
+			if (stage == 0)
+			{
+				FormatEx(temp, sizeof(temp), "Main");
+			}
+			else
+			{
+				FormatEx(temp, sizeof(temp), "Bonus %d", stage);
+			}
+			IntToString(stage, stageString, sizeof(stageString));
+			menu.AddItem(stageString, temp, ITEMDRAW_DEFAULT);
+			
+			replaysAdded++;
+		}
+	}
+	
+	return replaysAdded;
+}
+
+public int MenuHandler_Replay(Menu menu, MenuAction action, int param1, int param2)
+{
+	if (action == MenuAction_Select)
+	{
+		char stageString[4];
+		menu.GetItem(param2, stageString, sizeof(stageString));
+		int stage = StringToInt(stageString);
+
+		char modeStr[32];
+		GOKZ_GL_GetModeString(selectedReplayMode[param1], modeStr, sizeof(modeStr));
+
+		DataPack dp = new DataPack();
+		dp.WriteCell(GetClientUserId(param1));
+		
+		GlobalAPI_GetRecordsTop(
+			GetRecordsTopCallback,
+			dp,
+			DEFAULT_STRING,
+			DEFAULT_STRING,
+			DEFAULT_INT,
+			gC_CurrentMap,
+			TICK_RATE,
+			stage,
+			modeStr,
+			DEFAULT_BOOL,
+			DEFAULT_STRING,
+			0,
+			BATCH_SIZE
+		);
+	}
+	else if (action == MenuAction_Cancel)
+	{
+		DisplayReplayModeMenu(param1);
+	}
+	else if (action == MenuAction_End)
+	{
+		delete menu;
+	}
+	return 0;
+}
+
+static void GetRecordsTopCallback(JSON_Object top, GlobalAPIRequestData request, DataPack dp)
 {
 	dp.Reset();
 	int client = GetClientOfUserId(dp.ReadCell());
@@ -118,9 +253,9 @@ static void DisplayReplayMenuCallback(JSON_Object top, GlobalAPIRequestData requ
 		return;
 	}
 
-	Menu menu = new Menu(MenuHandler_Replay);
+	Menu menu = new Menu(GetRecordsTopMenuHandler_Replay);
 	menu.SetTitle("%T", "Replay Menu - Title", client, gC_CurrentMap, gC_ModeNames[selectedReplayMode[client]]);
-	if (ReplayMenuAddItems(menu, top) > 0)
+	if (GetRecordsTopMenuAddItems(menu, top) > 0)
 	{
 		menu.Pagination = 5;
 		menu.Display(client, MENU_TIME_FOREVER);
@@ -133,8 +268,7 @@ static void DisplayReplayMenuCallback(JSON_Object top, GlobalAPIRequestData requ
 	}
 }
 
-// Returns the number of replay menu items added
-static int ReplayMenuAddItems(Menu menu, JSON_Object records)
+static int GetRecordsTopMenuAddItems(Menu menu, JSON_Object records)
 {
 	int replaysAdded = 0;
 	char playerName[MAX_NAME_LENGTH];
@@ -168,7 +302,7 @@ stock void buildReplayPath(int replayId, char[] replayPath, int replayPathLength
 			RP_DIRECTORY_RUNS, gC_CurrentMap, replayId, RP_FILE_EXTENSION);
 }
 
-public int MenuHandler_Replay(Menu menu, MenuAction action, int param1, int param2)
+public int GetRecordsTopMenuHandler_Replay(Menu menu, MenuAction action, int param1, int param2)
 {
 	if (action == MenuAction_Select)
 	{
@@ -204,6 +338,7 @@ public int MenuHandler_Replay(Menu menu, MenuAction action, int param1, int para
 	{
 		delete menu;
 	}
+	return 0;
 }
 
 public int MenuHandler_ReplayCompleted(Handle HTTPRequest, bool bFailure, bool bRequestSuccessful, EHTTPStatusCode eStatusCode, DataPack dp) {
@@ -218,12 +353,15 @@ public int MenuHandler_ReplayCompleted(Handle HTTPRequest, bool bFailure, bool b
 
         SteamWorks_WriteHTTPResponseBodyToFile(HTTPRequest, replayPath);
 
+		// Only way to load a replay
 		GOKZ_RP_LoadJumpReplay(client, replayPath);
     }
 	else {
 		PrintToServer("GlobalReplay: Could not fetch global replay %d with error code %d.", replayId, eStatusCode);
-		GOKZ_PrintToChatAll(true, "Could not fetch global replay %d with error code %d. Contact administrator.", replayId, eStatusCode);
+		GOKZ_PrintToChatAll(true, "{darkred}Could not fetch global replay %d with error code %d. Contact administrator.", replayId, eStatusCode);
 	}
 
 	CloseHandle(HTTPRequest);
+
+	return 0;
 }
